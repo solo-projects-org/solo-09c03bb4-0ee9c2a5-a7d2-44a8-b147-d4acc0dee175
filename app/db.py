@@ -100,6 +100,32 @@ CREATE TABLE IF NOT EXISTS verdicts (
     PRIMARY KEY (mmsi, version, raw_row_id)
 );
 CREATE INDEX IF NOT EXISTS verdicts_version ON verdicts(mmsi, version);
+
+-- Daily grid density publications.  A row exists only for a *frozen* first
+-- publication; re-publishing the same day is a no-op.  The table deliberately
+-- stores no MMSI and no sub-threshold cell, so hidden vessels cannot leak
+-- through the database.  Grid work runs in BEGIN IMMEDIATE, the same lock
+-- uploads use, hence the aggregation always reads one fully committed track
+-- state and two instances can never publish the same day twice.
+CREATE TABLE IF NOT EXISTS grid_publications (
+    day             TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'published',
+    cell_count      INTEGER NOT NULL,
+    csv_path        TEXT NOT NULL,
+    csv_sha256       TEXT NOT NULL,
+    byte_size       INTEGER NOT NULL,
+    published_at    TEXT NOT NULL,
+    source_snapshot TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS grid_cells (
+    day              TEXT NOT NULL REFERENCES grid_publications(day),
+    lat_index        INTEGER NOT NULL,
+    lon_index        INTEGER NOT NULL,
+    distinct_vessels INTEGER NOT NULL CHECK (distinct_vessels >= 3),
+    PRIMARY KEY (day, lat_index, lon_index)
+);
+CREATE INDEX IF NOT EXISTS grid_cells_day ON grid_cells(day);
 """
 
 

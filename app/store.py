@@ -27,13 +27,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import ais
+from . import ais, grid
 from .db import write_tx
 
 STAGING_PREFIX = ".staging-"
 
 
 class UploadError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class GridPublishError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
@@ -50,6 +57,18 @@ class PublishedBatch:
     rows_total: int
 
 
+@dataclass
+class PublishedGrid:
+    day: str
+    cell_count: int
+    csv_path: str
+    csv_sha256: str
+    byte_size: int
+    published_at: str
+    source_snapshot: str
+    reused: bool
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -58,16 +77,19 @@ class Store:
     def __init__(self, root: Path, conn: sqlite3.Connection):
         self.root = Path(root)
         self.originals_dir = self.root / "originals"
+        self.grids_dir = self.root / "grids"
         self.conn = conn
         self.originals_dir.mkdir(parents=True, exist_ok=True)
+        self.grids_dir.mkdir(parents=True, exist_ok=True)
 
     # -- startup recovery -------------------------------------------------
 
     def cleanup_staging(self) -> None:
         """Remove staging/orphan directories left by a crash.
 
-        Only directories never referenced by a committed batch are touched;
-        published batches are immutable and always survive a restart.
+        Only directories never referenced by a committed row are touched;
+        published batches and frozen grid days are immutable and always
+        survive a restart.
         """
 
         for entry in self.originals_dir.iterdir():
@@ -81,6 +103,19 @@ class Store:
             ).fetchone()
             if row is None:
                 shutil.rmtree(entry, ignore_errors=True)
+
+        # Grid CSV staging lives directly under grids/ as .staging-* files;
+        # every non-staging file must map to a frozen grid_publications row.
+        for entry in self.grids_dir.iterdir():
+            if entry.name.startswith(STAGING_PREFIX) or entry.name.endswith(".tmp"):
+                entry.unlink(missing_ok=True)
+                continue
+            row = self.conn.execute(
+                "SELECT 1 FROM grid_publications WHERE csv_path = ?",
+                (str(Path("grids") / entry.name),),
+            ).fetchone()
+            if row is None:
+                entry.unlink(missing_ok=True)
 
     # -- publication ------------------------------------------------------
 
@@ -288,6 +323,154 @@ class Store:
             "DELETE FROM track_points WHERE mmsi = ? AND version < ?", (mmsi, version)
         )
         conn.execute("DELETE FROM verdicts WHERE mmsi = ? AND version < ?", (mmsi, version))
+
+    # -- daily grid density publication ----------------------------------
+
+    def publish_grid(self, day: str) -> PublishedGrid:
+        """Freeze the first 0.1-degree density publication for one UTC day.
+
+        Concurrency model: the whole aggregation runs in one ``BEGIN IMMEDIATE``
+        transaction, the same lock an upload takes.  A publish therefore reads a
+        single fully committed track state - it can never observe a half-written
+        batch - and concurrent uploads/publishes serialise against it.  Because
+        ``grid_publications.day`` is a primary key, two instances racing for the
+        same day resolve to one insert: the loser re-reads the winner's frozen
+        row and returns it, so exactly one complete CSV exists per day.
+
+        The CSV is staged, fsynced and renamed inside the transaction; any
+        failure rolls the database back and removes the file, leaving no
+        downloadable residue.  Retrying then starts from the unchanged state.
+        """
+
+        day = grid.parse_utc_day(day)
+        staging: Path | None = None
+        final_path = self.grids_dir / f"grid_{day}.csv"
+        relative = str(Path("grids") / final_path.name)
+
+        try:
+            with write_tx(self.conn) as conn:
+                existing = conn.execute(
+                    "SELECT * FROM grid_publications WHERE day = ?", (day,)
+                ).fetchone()
+                if existing is not None:
+                    # First publication is immutable: re-publish and late
+                    # telegrams must never touch the frozen archive.
+                    return PublishedGrid(
+                        day=existing["day"],
+                        cell_count=existing["cell_count"],
+                        csv_path=existing["csv_path"],
+                        csv_sha256=existing["csv_sha256"],
+                        byte_size=existing["byte_size"],
+                        published_at=existing["published_at"],
+                        source_snapshot=existing["source_snapshot"],
+                        reused=True,
+                    )
+
+                snapshot = self._track_snapshot(conn)
+                rows = conn.execute(
+                    "SELECT mmsi, utc, lat, lon FROM track_points"
+                ).fetchall()
+                points = (
+                    grid.GridPoint(
+                        mmsi=r["mmsi"], utc=r["utc"], lat=r["lat"], lon=r["lon"]
+                    )
+                    for r in rows
+                )
+                # Suppression happens here: cells under 3 distinct MMSIs are
+                # dropped before anything is written anywhere.
+                cells = grid.aggregate_cells(day, points)
+                csv_bytes = grid.render_cells_csv(day, cells)
+                digest = hashlib.sha256(csv_bytes).hexdigest()
+                published_at = _utcnow()
+
+                fd, staging_name = tempfile.mkstemp(
+                    prefix=STAGING_PREFIX, suffix=".tmp", dir=self.grids_dir
+                )
+                staging = Path(staging_name)
+                # mkstemp hands back an open descriptor; close before re-opening.
+                os.close(fd)
+                with open(staging, "wb") as fh:
+                    fh.write(csv_bytes)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                if final_path.exists():
+                    final_path.unlink()
+                os.rename(staging, final_path)
+                _fsync_dir(self.grids_dir)
+                staging = None
+
+                conn.execute(
+                    """
+                    INSERT INTO grid_publications
+                        (day, status, cell_count, csv_path, csv_sha256, byte_size,
+                         published_at, source_snapshot)
+                    VALUES (?, 'published', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        day,
+                        len(cells),
+                        relative,
+                        digest,
+                        len(csv_bytes),
+                        published_at,
+                        snapshot,
+                    ),
+                )
+                conn.executemany(
+                    "INSERT INTO grid_cells (day, lat_index, lon_index, distinct_vessels)"
+                    " VALUES (?, ?, ?, ?)",
+                    [(day, c.lat_index, c.lon_index, c.distinct_vessels) for c in cells],
+                )
+        except grid.DateError:
+            raise
+        except OSError as exc:
+            if staging is not None:
+                staging.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            raise GridPublishError(503, f"网格统计写盘失败，未生成可下载文件: {exc}") from exc
+        except Exception as exc:
+            # Transaction was rolled back by write_tx; the unreferenced file
+            # must not survive as a downloadable residue.
+            if staging is not None:
+                staging.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            if isinstance(exc, GridPublishError):
+                raise
+            raise GridPublishError(503, f"网格发布失败，登记已回滚且未留下残档: {exc}") from exc
+
+        return PublishedGrid(
+            day=day,
+            cell_count=len(cells),
+            csv_path=relative,
+            csv_sha256=digest,
+            byte_size=len(csv_bytes),
+            published_at=published_at,
+            source_snapshot=snapshot,
+            reused=False,
+        )
+
+    @staticmethod
+    def _track_snapshot(conn: sqlite3.Connection) -> str:
+        """Compact fingerprint of the committed track state used by a publish.
+
+        Taken inside the publication transaction, it records which committed
+        state the frozen CSV was computed from for later audit.
+        """
+
+        batch_count = conn.execute("SELECT COUNT(*) c FROM batches").fetchone()["c"]
+        raw_max = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) m FROM raw_rows"
+        ).fetchone()["m"]
+        point_count = conn.execute(
+            "SELECT COUNT(*) c FROM track_points"
+        ).fetchone()["c"]
+        vessel_count = conn.execute(
+            "SELECT COUNT(*) c FROM vessels"
+        ).fetchone()["c"]
+        return (
+            f"batches={batch_count};raw_rows_max_id={raw_max};"
+            f"trusted_points={point_count};vessels={vessel_count}"
+        )
 
 
 def _fsync_dir(path: Path) -> None:

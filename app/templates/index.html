@@ -39,6 +39,11 @@
 <p class="muted">还没有已发布批次。</p>
 {% endif %}
 
+<h2>每日网格密度发布</h2>
+<p class="muted">按 UTC 日、0.1° 固定网格统计不同 MMSI 的船舶活动密度（同船同格只计一次，
+不足 3 船的格子整体隐藏，不输出单船航迹）。首次发布即固化，重复发布与后到电文不改旧档。</p>
+<p><a href="/grids">查看已固化网格发布</a> · <a href="/grids/publish">发布某日网格统计</a></p>
+
 <h2>船舶</h2>
 {% if vessels %}
 <div class="scroll">

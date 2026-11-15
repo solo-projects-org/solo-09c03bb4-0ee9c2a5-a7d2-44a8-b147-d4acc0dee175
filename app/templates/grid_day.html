@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}网格密度 {{ publication["day"] }}{% endblock %}
+{% block content %}
+<p><a href="/grids">← 返回网格密度</a></p>
+<h2>{{ publication["day"] }}（UTC）船舶活动密度</h2>
+<table>
+  <tbody>
+    <tr><th>状态</th><td><span class="badge ok">已固化</span>（重复发布与后到电文不会修改本档）</td></tr>
+    <tr><th class="num">可见格子数</th><td>{{ publication["cell_count"] }}</td></tr>
+    <tr><th>固化时间</th><td>{{ publication["published_at"] }}</td></tr>
+    <tr><th>取数航迹快照</th><td><code>{{ publication["source_snapshot"] }}</code></td></tr>
+    <tr><th>CSV SHA-256</th><td><code>{{ publication["csv_sha256"] }}</code></td></tr>
+    <tr><th>下载</th><td><a href="/grids/{{ publication['day'] }}/grid.csv">下载固化 CSV</a></td></tr>
+  </tbody>
+</table>
+<p class="muted">
+  下表每个格子为一个 0.1°×0.1° 固定网格，数值为当日落在该格的<strong>不同 MMSI 数</strong>
+  （同船同格只计一次）。不同 MMSI 少于 {{ min_vessels }} 船的格子不显示、不入 CSV、不落库，
+  本页不提供任何单船航迹或船号信息。
+</p>
+
+{% if cells %}
+<div class="scroll">
+<table>
+  <thead>
+    <tr>
+      <th class="num">纬度下限</th><th class="num">纬度上限</th>
+      <th class="num">经度下限</th><th class="num">经度上限</th>
+      <th class="num">不同船舶数</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for c in cells %}
+    <tr>
+      <td class="num">{{ "%.1f"|format(c["lat_min"]) }}</td>
+      <td class="num">{{ "%.1f"|format(c["lat_max"]) }}</td>
+      <td class="num">{{ "%.1f"|format(c["lon_min"]) }}</td>
+      <td class="num">{{ "%.1f"|format(c["lon_max"]) }}</td>
+      <td class="num">{{ c["distinct_vessels"] }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">当日没有任何格子达到 {{ min_vessels }} 船的发布门槛；CSV 仅含表头，无格子数据。</p>
+{% endif %}
+{% endblock %}

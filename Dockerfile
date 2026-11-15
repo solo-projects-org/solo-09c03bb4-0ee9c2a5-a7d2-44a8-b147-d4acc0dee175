@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN mkdir -p /data/originals \
+RUN mkdir -p /data/originals /data/grids \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin ais \
     && chown -R ais:ais /data /srv
 USER ais

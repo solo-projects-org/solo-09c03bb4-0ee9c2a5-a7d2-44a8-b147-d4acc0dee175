@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}每日网格密度{% endblock %}
+{% block content %}
+<p><a href="/">← 返回总览</a></p>
+<h2>每日船舶活动密度（0.1° 固定网格 · 按 UTC 日）</h2>
+<p class="muted">
+  统计口径：仅使用当日<strong>可信 AIS 点</strong>，按经纬度 0.1° 固定网格统计不同 MMSI 数，
+  同船同格当日只计一次；不同 MMSI 不足 <strong>3 船</strong>的格子整体隐藏，
+  页面、CSV 与数据库均不包含被隐藏格子的计数或船号。首次发布即固化，重复发布与后到电文不改动旧档。
+</p>
+<p><a href="/grids/publish"><button type="button">发布某日网格统计</button></a></p>
+
+<h2>已固化发布</h2>
+{% if publications %}
+<div class="scroll">
+<table>
+  <thead>
+    <tr><th>UTC 日</th><th class="num">可见格子数</th><th>固化时间</th><th>操作</th></tr>
+  </thead>
+  <tbody>
+  {% for p in publications %}
+    <tr>
+      <td><a href="/grids/{{ p['day'] }}">{{ p["day"] }}</a></td>
+      <td class="num">{{ p["cell_count"] }}</td>
+      <td>{{ p["published_at"] }}</td>
+      <td>
+        <a href="/grids/{{ p['day'] }}">查看页面</a> ·
+        <a href="/grids/{{ p['day'] }}/grid.csv">下载固化 CSV</a>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">还没有已固化的网格发布。</p>
+{% endif %}
+{% endblock %}

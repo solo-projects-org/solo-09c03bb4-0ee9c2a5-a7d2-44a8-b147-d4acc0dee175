@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}发布网格统计{% endblock %}
+{% block content %}
+<p><a href="/grids">← 返回网格密度</a></p>
+<h2>按 UTC 日发布网格统计</h2>
+<p class="muted">
+  发布将从当前<strong>同一已提交航迹状态</strong>取数（与并发上传互斥，不会读到半个批次）。
+  若该日已经发布过，系统不会重新计算，而是返回既有固化档案；后到电文也不会改变旧档。
+</p>
+<form class="upload" method="post" action="/grids/publish">
+  <label for="day">UTC 日（YYYY-MM-DD）：</label>
+  <input type="date" id="day" name="day" required>
+  <button type="submit">发布 / 查看固化档案</button>
+</form>
+
+{% if frozen_days %}
+<h2>已固化日期（重复发布将直接返回旧档）</h2>
+<ul>
+  {% for d in frozen_days %}
+  <li><a href="/grids/{{ d }}">{{ d }}</a> · <a href="/grids/{{ d }}/grid.csv">CSV</a></li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

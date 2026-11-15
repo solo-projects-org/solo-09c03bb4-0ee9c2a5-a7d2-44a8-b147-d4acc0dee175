@@ -7,13 +7,14 @@ import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
 from .ais import MAX_SPEED_KNOTS
+from . import grid
 from .db import connect, init_db, read_tx
-from .store import Store, UploadError
+from .store import GridPublishError, Store, UploadError
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("AIS_DATA_DIR", BASE_DIR.parent / "data"))
@@ -39,11 +40,13 @@ app = FastAPI(title="岸站 AIS 可信航迹", lifespan=lifespan)
 
 
 def _conn() -> sqlite3.Connection:
-    return connect(DB_PATH)
+    # Read the module globals dynamically instead of binding them as default
+    # arguments, so tests (and future reconfiguration) see the current path.
+    return connect(Path(globals()["DB_PATH"]))
 
 
 def _store(conn: sqlite3.Connection) -> Store:
-    return Store(DATA_DIR, conn)
+    return Store(Path(globals()["DATA_DIR"]), conn)
 
 
 def _render(request: Request, name: str, status_code: int = 200, **context):
@@ -378,6 +381,169 @@ def _render_isolated_csv(mmsi: str, rows) -> bytes:
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
+
+
+# --------------------------------------------------------------------------
+# Daily grid density (k-anonymised, no per-vessel data)
+# --------------------------------------------------------------------------
+
+
+def _grid_cell_bounds(rows):
+    """Decorate persisted cell rows with display bounds (no extra round-trip)."""
+
+    result = []
+    for r in rows:
+        lat_lo, lat_hi = grid.cell_bounds(r["lat_index"])
+        lon_lo, lon_hi = grid.cell_bounds(r["lon_index"])
+        result.append(
+            {
+                "lat_min": lat_lo,
+                "lat_max": lat_hi,
+                "lon_min": lon_lo,
+                "lon_max": lon_hi,
+                "distinct_vessels": r["distinct_vessels"],
+            }
+        )
+    return result
+
+
+@app.get("/grids", response_class=HTMLResponse)
+def grid_index(request: Request):
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            publications = conn.execute(
+                "SELECT * FROM grid_publications ORDER BY day DESC"
+            ).fetchall()
+            summaries = [
+                {
+                    "day": p["day"],
+                    "cell_count": p["cell_count"],
+                    "published_at": p["published_at"],
+                }
+                for p in publications
+            ]
+    finally:
+        conn.close()
+    return _render(request, "grids.html", publications=summaries)
+
+
+@app.get("/grids/publish", response_class=HTMLResponse)
+def grid_publish_form(request: Request):
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            frozen_days = [
+                r["day"]
+                for r in conn.execute(
+                    "SELECT day FROM grid_publications ORDER BY day DESC"
+                ).fetchall()
+            ]
+    finally:
+        conn.close()
+    return _render(request, "grid_publish.html", frozen_days=frozen_days)
+
+
+@app.post("/grids/publish")
+async def grid_publish(request: Request, day: str = Form(...)):
+    try:
+        parsed_day = grid.parse_utc_day(day)
+    except grid.DateError as exc:
+        return _render(
+            request,
+            "error.html",
+            title="发布日期无效",
+            message=str(exc),
+            status_code=400,
+        )
+
+    def worker():
+        conn = _conn()
+        try:
+            return _store(conn).publish_grid(parsed_day)
+        finally:
+            conn.close()
+
+    import anyio
+
+    try:
+        outcome = await anyio.to_thread.run_sync(worker)
+    except GridPublishError as exc:
+        return _render(
+            request,
+            "error.html",
+            title="网格统计未发布",
+            message=exc.message,
+            status_code=exc.status,
+        )
+    # On a race the other instance's frozen publication is reused; both
+    # responses point at the single complete result.
+    return RedirectResponse(url=f"/grids/{outcome.day}", status_code=303)
+
+
+@app.get("/grids/{day}", response_class=HTMLResponse)
+def grid_day(request: Request, day: str):
+    try:
+        parsed_day = grid.parse_utc_day(day)
+    except grid.DateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            publication = conn.execute(
+                "SELECT * FROM grid_publications WHERE day = ?", (parsed_day,)
+            ).fetchone()
+            if publication is None:
+                raise HTTPException(status_code=404, detail="该 UTC 日尚未发布网格统计")
+            rows = conn.execute(
+                "SELECT * FROM grid_cells WHERE day = ? ORDER BY lat_index, lon_index",
+                (parsed_day,),
+            ).fetchall()
+            cells = _grid_cell_bounds(rows)
+    finally:
+        conn.close()
+    return _render(
+        request,
+        "grid_day.html",
+        publication=publication,
+        cells=cells,
+        min_vessels=grid.MIN_VESSELS_PER_CELL,
+    )
+
+
+@app.get("/grids/{day}/grid.csv")
+def grid_day_csv(day: str):
+    try:
+        parsed_day = grid.parse_utc_day(day)
+    except grid.DateError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    conn = _conn()
+    try:
+        with read_tx(conn):
+            publication = conn.execute(
+                "SELECT * FROM grid_publications WHERE day = ?", (parsed_day,)
+            ).fetchone()
+            if publication is None:
+                # Do not reveal whether a hidden/unpublished day has any data.
+                raise HTTPException(status_code=404, detail="该 UTC 日尚未发布网格统计")
+            path = DATA_DIR / publication["csv_path"]
+            digest = publication["csv_sha256"]
+            exists = path.is_file()
+    finally:
+        conn.close()
+    if not exists:
+        raise HTTPException(status_code=410, detail="固化 CSV 缺失，已不可下载")
+    opened = open(path, "rb")
+    return StreamingResponse(
+        _file_chunks(opened),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": _attachment(f"grid_{parsed_day}.csv"),
+            "X-Content-SHA256": digest,
+        },
+    )
 
 
 def _file_chunks(fh, size: int = 1 << 20):
